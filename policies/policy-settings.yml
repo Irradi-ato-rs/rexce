@@ -1,0 +1,105 @@
+# File: policies/policy-settings.yml
+# Metadata Header
+# Title: policy-settings.yml
+# Owner(s): SRE, Security, Repo Owners
+# Reviewed: 2026-03-13T00:00:00Z
+# Purpose: Policy configuration for the validator (strict, config-driven, zero-drift).
+# Guardrails: PR-gated, policy-validated, signature-aware, lock-bits for invariants.
+
+policy:
+  schema_version: 1
+
+  regulated:
+    # Derive "regulated" from any of these boolean paths (true => regulated)
+    derive_from:
+      fields:
+        - "release.compliance_scope.gdpr"
+        - "release.compliance_scope.pci"
+
+    # Enforce canary strategy in promotions when effective regulated mode is true
+    require_canary: true
+
+    # If override.regulated=false (downgrade), guardrails must be satisfied
+    override:
+      enabled: true
+      label: "regulatory-override-approved"
+      max_days: 7
+      required_fields: ["reason","ticket","approved_by","approved_at","expires_at"]
+      required_approvals: ["security","sre"]
+      lock: true  # keep downgrades strongly gated
+
+    # Additional regulated readiness expectations
+    operational_readiness:
+      rollback_min_triggers: 2  # same as earliest invariant
+
+  evidence:
+    # Required field paths in release-record input (mirrors earliest invariants)
+    require:
+      - "release.id"
+      - "release.service"
+      - "release.created_at"
+      - "release.change_type"
+      - "release.risk_class"
+      - "release.compliance_scope.gdpr"
+      - "release.compliance_scope.pci"
+      - "source.repo"
+      - "source.commit_sha"
+      - "source.tag"
+      - "artifacts.container_image.name"
+      - "artifacts.container_image.digest"
+      - "artifacts.sbom.type"
+      - "artifacts.sbom.ref"
+      - "artifacts.provenance.ref"
+      - "quality.tests.unit"
+      - "quality.security.sast"
+      - "quality.policy.opa_conftest"
+      - "operational_readiness.slo.dashboard_url"
+      - "operational_readiness.runbook_url"
+      - "operational_readiness.rollback.strategy"
+      - "operational_readiness.rollback.triggers"
+      - "approvals.required"
+
+    placeholders:
+      # Placeholder token detection (case-insensitive, substring check)
+      tokens: ["<", "replace-me", "todo", "example", "tbd"]
+
+    sbom:
+      type: "spdx-json"
+      exact_ref: "evidence/sbom.spdx.json"
+      lock: true  # keep exact ref invariant
+
+    provenance:
+      allowed_refs:
+        - "evidence/provenance.intoto.jsonl"
+        - "evidence/provenance.intoto.json"
+      lock: true  # restrict provenance filenames
+
+    supply_chain:
+      container_digest_prefixes: ["sha256:"]
+      lock: true
+
+    inventory:
+      require_sig_bundle: true  # require .sig and .bundle siblings if inventory is provided
+
+  compliance:
+    pci:
+      require_risk_class: "high"
+      lock: true
+
+  promotion:
+    append_only: true
+    regulated_canary_stages: ["1%", "5%", "25%", "50%", "100%"]
+
+  validator:
+    created_at_path_binding: true  # releases/YYYY/MM/<release.id>
+
+  signature:
+    # Files that must exist and pass cosign verification (artifact + .sig + .bundle)
+    verify_refs:
+      required:
+        - "release-record.yml"
+        - "evidence/sbom.spdx.json"
+        - "evidence/provenance.intoto.jsonl"
+        - "evidence/test-summary.json"
+        - "evidence/security-summary.json"
+        - "evidence/policy-evaluation.json"

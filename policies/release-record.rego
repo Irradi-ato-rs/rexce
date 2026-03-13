@@ -1,11 +1,94 @@
+# File: policies/release-record.rego
+# Metadata Header
+# Title: release-record.rego
+# Owner(s): SRE, Security, Repo Owners
+# Reviewed: 2026-03-13T00:00:00Z
+# Purpose: Validate release record evidence including overrides and regulated rules; reads config from policy-settings.yml.
+# Guardrails: Overrides must be time-boxed and approved; required fields and supply chain invariants enforced.
+# Inputs: JSON payload composed by workflow (see validate-evidence.yml); Data via -d policies/policy-settings.yml
+# Outputs: deny[] messages on violations.
+
 package release
+
+config := data["policy-settings"].policy
+
+########################
+# Generic helpers
+########################
 
 is_bool(x) { type_name(x) == "boolean" }
 is_string(x) { type_name(x) == "string" }
 
-# Derived regulated status from compliance flags
+lower_str(s) := lower(s)
+
+trim(s) := out {
+  out := regex.replace("^\\s+|\\s+$", s, "")
+}
+
+has_nonempty(v) {
+  is_string(v)
+  trim(v) != ""
+  lower(v) != "tbd"
+  not contains(lower(v), "todo")
+  not contains(lower(v), "replace-me")
+}
+
+is_rfc3339(ts) {
+  is_string(ts)
+  regex.match("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:Z|[+-]\\d{2}:\\d{2})$", ts)
+}
+
+parse_ns(ts) := ns {
+  ns := time.parse_rfc3339_ns(ts)
+}
+
+has_label(lbl) {
+  some i
+  input.meta.pr_labels[i] == lbl
+}
+
+has_path(obj, path) {
+  count(path) == 0
+} else {
+  key := path[0]
+  obj[key]
+  has_path(obj[key], array.slice(path, 1, count(path)))
+}
+
+get_path(obj, path) = v {
+  count(path) == 0
+  v := obj
+} else {
+  key := path[0]
+  v := get_path(obj[key], array.slice(path, 1, count(path)))
+}
+
+valid_evidence_ref(ref) {
+  is_string(ref)
+  startswith(ref, "evidence/")
+  not startswith(ref, "/")
+  not contains(ref, "://")
+  not contains(ref, "..")
+  not contains(ref, "\\")
+}
+
+is_placeholder(s) {
+  is_string(s)
+  some t
+  t := config.evidence.placeholders.tokens[_]
+  contains(lower(s), lower(t))
+}
+
+########################
+# Regulated mode (derived + override guardrails)
+########################
+
 derived_regulated {
-  (input.release.compliance_scope.gdpr == true) or (input.release.compliance_scope.pci == true)
+  some p
+  p := config.regulated.derive_from.fields[_]
+  has_path(input, split(p, "."))
+  v := get_path(input, split(p, "."))
+  v == true
 }
 
 override_present { is_bool(input.policy.regulated) }
@@ -16,9 +99,49 @@ downgrade_override {
   input.policy.regulated == false
 }
 
-# Effective regulated mode:
-# - If override is present and allowed, use it
-# - Else derive from compliance_scope
+# Guardrails required only for downgrade
+override_allowed {
+  not downgrade_override
+} else {
+  downgrade_override
+
+  # PR label
+  has_label(config.regulated.override.label)
+
+  # Required policy fields
+  not some_missing_field
+  some_missing_field {
+    f := config.regulated.override.required_fields[_]
+    not has_nonempty(get_path(input.policy, [f]))
+  }
+
+  # Timestamps shape + bounded expiry
+  is_rfc3339(input.policy.approved_at)
+  is_rfc3339(input.policy.expires_at)
+  expires_within_days(config.regulated.override.max_days)
+
+  # Approvals completed for required roles
+  not some_missing_approval
+  some_missing_approval {
+    r := config.regulated.override.required_approvals[_]
+    not approval_present(r)
+  }
+}
+
+expires_within_days(days) {
+  a := input.policy.approved_at
+  e := input.policy.expires_at
+  parse_ns(e) >= parse_ns(a)
+  (parse_ns(e) - parse_ns(a)) / 1000000000 <= days * 86400
+}
+
+approval_present(role) {
+  some i
+  a := input.approvals.required[i]
+  lower(a.role) == lower(role)
+  has_nonempty(a.approver)
+  is_rfc3339(a.approved_at)
+}
 
 effective_regulated {
   override_present
@@ -34,101 +157,21 @@ effective_regulated {
   derived_regulated
 }
 
-# --- Override guardrails (downgrade only) ---
-override_allowed {
-  not downgrade_override
-} else {
-  downgrade_override
-  has_label("regulatory-override-approved")
-  has_nonempty(input.policy.reason)
-  has_nonempty(input.policy.ticket)
-  has_nonempty(input.policy.approved_by)
-  is_rfc3339(input.policy.approved_at)
-  is_rfc3339(input.policy.expires_at)
-  expires_within_days(7)
-  approvals_completed_for_role("security")
-  approvals_completed_for_role("sre")
-}
+########################
+# Required fields
+########################
 
-# Deny downgrade override without guardrails
+required_paths := { p | p := config.evidence.require[_] }
 
 deny[msg] {
-  downgrade_override
-  not has_label("regulatory-override-approved")
-  msg := "Downgrade override requires PR label: regulatory-override-approved"
-}
-
-deny[msg] {
-  downgrade_override
-  not has_nonempty(input.policy.reason)
-  msg := "Downgrade override requires policy.reason"
-}
-
-deny[msg] {
-  downgrade_override
-  not has_nonempty(input.policy.ticket)
-  msg := "Downgrade override requires policy.ticket"
-}
-
-deny[msg] {
-  downgrade_override
-  not (has_nonempty(input.policy.approved_by) and is_rfc3339(input.policy.approved_at))
-  msg := "Downgrade override requires policy.approved_by and policy.approved_at (RFC3339)"
-}
-
-deny[msg] {
-  downgrade_override
-  not (is_rfc3339(input.policy.expires_at) and expires_within_days(7))
-  msg := "Downgrade override requires policy.expires_at (RFC3339) within 7 days"
-}
-
-deny[msg] {
-  downgrade_override
-  not approvals_completed_for_role("security")
-  msg := "Downgrade override requires completed Security approval in approvals.required"
-}
-
-deny[msg] {
-  downgrade_override
-  not approvals_completed_for_role("sre")
-  msg := "Downgrade override requires completed SRE approval in approvals.required"
-}
-
-# --- Required field validation ---
-
-required_paths := [
-  "release.id",
-  "release.service",
-  "release.created_at",
-  "release.change_type",
-  "release.risk_class",
-  "release.compliance_scope.gdpr",
-  "release.compliance_scope.pci",
-  "source.repo",
-  "source.commit_sha",
-  "source.tag",
-  "artifacts.container_image.name",
-  "artifacts.container_image.digest",
-  "artifacts.sbom.type",
-  "artifacts.sbom.ref",
-  "artifacts.provenance.ref",
-  "quality.tests.unit",
-  "quality.security.sast",
-  "quality.policy.opa_conftest",
-  "operational_readiness.slo.dashboard_url",
-  "operational_readiness.runbook_url",
-  "operational_readiness.rollback.strategy",
-  "operational_readiness.rollback.triggers",
-  "approvals.required"
-]
-
-deny[msg] {
-  some p in required_paths
+  p := required_paths[_]
   not has_path(input, split(p, "."))
   msg := sprintf("Missing required field: %s", [p])
 }
 
-# Regulated-mode readiness requirements (effective)
+########################
+# Regulated readiness invariants
+########################
 
 deny[msg] {
   effective_regulated
@@ -144,26 +187,39 @@ deny[msg] {
 
 deny[msg] {
   effective_regulated
-  count(input.operational_readiness.rollback.triggers) < 2
-  msg := "Regulated mode: rollback.triggers must contain at least 2 triggers"
+  count(input.operational_readiness.rollback.triggers) < config.regulated.operational_readiness.rollback_min_triggers
+  msg := sprintf("Regulated mode: rollback.triggers must contain at least %d triggers", [config.regulated.operational_readiness.rollback_min_triggers])
 }
 
-# PCI-specific rule (derived from compliance scope)
+########################
+# Compliance invariants (PCI => risk_class = high)
+########################
 
 deny[msg] {
   input.release.compliance_scope.pci == true
-  input.release.risk_class != "high"
-  msg := "PCI-scoped releases must have risk_class = high"
+  required := config.compliance.pci.require_risk_class
+  input.release.risk_class != required
+  msg := sprintf("PCI-scoped releases must have risk_class = %s", [required])
 }
 
-# Supply chain immutability
+########################
+# Supply chain invariants
+########################
 
 deny[msg] {
-  not startswith(input.artifacts.container_image.digest, "sha256:")
-  msg := "container_image.digest must start with sha256:"
+  not is_string(input.artifacts.container_image.digest)
+  msg := "container_image.digest must be present"
 }
 
-# SBOM: SPDX only
+deny[msg] {
+  is_string(input.artifacts.container_image.digest)
+  not some { prefix := config.evidence.supply_chain.container_digest_prefixes[_]; startswith(input.artifacts.container_image.digest, prefix) }
+  msg := sprintf("container_image.digest must start with one of: %v", [config.evidence.supply_chain.container_digest_prefixes])
+}
+
+########################
+# SBOM invariants
+########################
 
 deny[msg] {
   not is_string(input.artifacts.sbom.type)
@@ -171,9 +227,8 @@ deny[msg] {
 }
 
 deny[msg] {
-  is_string(input.artifacts.sbom.type)
-  input.artifacts.sbom.type != "spdx-json"
-  msg := sprintf("SBOM type must be exactly spdx-json (got: %v)", [input.artifacts.sbom.type])
+  input.artifacts.sbom.type != config.evidence.sbom.type
+  msg := sprintf("SBOM type must be exactly %s (got: %v)", [config.evidence.sbom.type, input.artifacts.sbom.type])
 }
 
 deny[msg] {
@@ -184,11 +239,13 @@ deny[msg] {
 
 deny[msg] {
   ref := input.artifacts.sbom.ref
-  ref != "evidence/sbom.spdx.json"
-  msg := sprintf("SBOM ref must be exactly evidence/sbom.spdx.json (got: %s)", [ref])
+  ref != config.evidence.sbom.exact_ref
+  msg := sprintf("SBOM ref must be exactly %s (got: %s)", [config.evidence.sbom.exact_ref, ref])
 }
 
-# Provenance reference
+########################
+# Provenance invariants
+########################
 
 deny[msg] {
   ref := input.artifacts.provenance.ref
@@ -199,16 +256,17 @@ deny[msg] {
 deny[msg] {
   ref := input.artifacts.provenance.ref
   not allowed_provenance_ref(ref)
-  msg := sprintf("Provenance ref must be an approved filename under evidence/ (got: %s)", [ref])
+  msg := sprintf("Provenance ref must be one of %v (got: %s)", [config.evidence.provenance.allowed_refs], [ref])
 }
 
 allowed_provenance_ref(ref) {
-  ref == "evidence/provenance.intoto.jsonl"
-} else {
-  ref == "evidence/provenance.intoto.json"
+  some i
+  config.evidence.provenance.allowed_refs[i] == ref
 }
 
-# Inventory binding (optional)
+########################
+# Inventory binding (optional but recommended)
+########################
 
 has_inventory {
   input.inventory.files
@@ -221,6 +279,7 @@ inventory_has(path) {
 }
 
 deny[msg] {
+  config.evidence.inventory.require_sig_bundle == true
   has_inventory
   ref := input.artifacts.sbom.ref
   not inventory_has(ref)
@@ -228,6 +287,7 @@ deny[msg] {
 }
 
 deny[msg] {
+  config.evidence.inventory.require_sig_bundle == true
   has_inventory
   ref := input.artifacts.sbom.ref
   not inventory_has(sprintf("%s.sig", [ref]))
@@ -235,6 +295,7 @@ deny[msg] {
 }
 
 deny[msg] {
+  config.evidence.inventory.require_sig_bundle == true
   has_inventory
   ref := input.artifacts.sbom.ref
   not inventory_has(sprintf("%s.bundle", [ref]))
@@ -242,6 +303,7 @@ deny[msg] {
 }
 
 deny[msg] {
+  config.evidence.inventory.require_sig_bundle == true
   has_inventory
   ref := input.artifacts.provenance.ref
   not inventory_has(ref)
@@ -249,6 +311,7 @@ deny[msg] {
 }
 
 deny[msg] {
+  config.evidence.inventory.require_sig_bundle == true
   has_inventory
   ref := input.artifacts.provenance.ref
   not inventory_has(sprintf("%s.sig", [ref]))
@@ -256,83 +319,51 @@ deny[msg] {
 }
 
 deny[msg] {
+  config.evidence.inventory.require_sig_bundle == true
   has_inventory
   ref := input.artifacts.provenance.ref
   not inventory_has(sprintf("%s.bundle", [ref]))
   msg := sprintf("Missing provenance bundle file: %s.bundle", [ref])
 }
 
-# --- Helpers ---
+########################
+# Explicit downgrade guardrail denials (clear reasons)
+########################
 
-has_label(lbl) {
-  some i
-  input.meta.pr_labels[i] == lbl
+deny[msg] {
+  downgrade_override
+  not has_label(config.regulated.override.label)
+  msg := sprintf("Downgrade override requires PR label: %s", [config.regulated.override.label])
 }
 
-has_nonempty(v) {
-  is_string(v)
-  trim(v) != ""
-  lower(v) != "tbd"
-  not contains(lower(v), "todo")
-  not contains(lower(v), "replace-me")
+deny[msg] {
+  downgrade_override
+  some f
+  f := config.regulated.override.required_fields[_]
+  not has_nonempty(get_path(input.policy, [f]))
+  msg := sprintf("Downgrade override requires non-empty policy.%s", [f])
 }
 
-trim(s) := out {
-  out := regex.replace("^\\s+|\\s+$", s, "")
+deny[msg] {
+  downgrade_override
+  not (is_rfc3339(input.policy.approved_at) and is_rfc3339(input.policy.expires_at))
+  msg := "Downgrade override requires policy.approved_at and policy.expires_at (RFC3339)"
 }
 
-is_rfc3339(ts) {
-  is_string(ts)
-  regex.match("^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}(?:Z|[+-]\\d{2}:\\d{2})$", ts)
+deny[msg] {
+  downgrade_override
+  not expires_within_days(config.regulated.override.max_days)
+  msg := sprintf("Downgrade override requires policy.expires_at within %d days of approved_at", [config.regulated.override.max_days])
 }
 
-parse_ns(ts) := ns {
-  ns := time.parse_rfc3339_ns(ts)
+deny[msg] {
+  downgrade_override
+  not approval_present("security")
+  msg := "Downgrade override requires completed Security approval in approvals.required"
 }
 
-expires_within_days(days) {
-  a := input.policy.approved_at
-  e := input.policy.expires_at
-  parse_ns(e) >= parse_ns(a)
-  (parse_ns(e) - parse_ns(a)) / 1000000000 <= days * 86400
-}
-
-approvals_completed_for_role(role) {
-  some i
-  a := input.approvals.required[i]
-  lower(a.role) == role
-  has_nonempty(a.approver)
-  is_rfc3339(a.approved_at)
-}
-
-valid_evidence_ref(ref) {
-  is_string(ref)
-  startswith(ref, "evidence/")
-  not startswith(ref, "/")
-  not contains(ref, "://")
-  not contains(ref, "..")
-  not contains(ref, "\\")
-}
-
-is_placeholder(s) {
-  is_string(s)
-  contains(lower(s), "<")
-} else {
-  is_string(s)
-  contains(lower(s), "replace-me")
-} else {
-  is_string(s)
-  contains(lower(s), "todo")
-} else {
-  is_string(s)
-  contains(lower(s), "example")
-}
-
-has_path(obj, path) {
-  count(path) == 0
-} else {
-  key := path[0]
-  rest := array.slice(path, 1, count(path))
-  obj[key]
-  has_path(obj[key], rest)
+deny[msg] {
+  downgrade_override
+  not approval_present("sre")
+  msg := "Downgrade override requires completed SRE approval in approvals.required"
 }

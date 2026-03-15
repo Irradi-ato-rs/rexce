@@ -1,55 +1,169 @@
-- name: Verify Xcectua Interface version (tag == VERSION; fail-closed)
-  shell: bash
-  run: |
-    set -euo pipefail
+name: Release rexec (RER + Consumer Kit)
 
-    # -----------------------------
-    # Invariant: Git tag vX.Y.Z must match kit VERSION (X.Y.Z)
-    # -----------------------------
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
 
-    # Defensive: this step is intended for tag refs
-    # GITHUB_REF_NAME is typically the tag name on tag-triggered workflows.
-    if [[ -z "${GITHUB_REF_NAME:-}" ]]; then
-      echo "ERROR: GITHUB_REF_NAME is empty; this step expects to run on tag refs." >&2
-      exit 1
-    fi
+permissions:
+  contents: write
 
-    TAG_NAME="${GITHUB_REF_NAME}"
+jobs:
+  release:
+    name: Tag Release (policy tests + kit invariants)
+    runs-on: ubuntu-latest
 
-    # Enforce tag format: vX.Y.Z (strict SemVer core; no prerelease/build in this invariant)
-    if [[ ! "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "ERROR: Tag '${TAG_NAME}' does not match required format 'vX.Y.Z'." >&2
-      exit 1
-    fi
+    steps:
+      - name: Checkout rexec repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-    TAG_VERSION="${TAG_NAME#v}"
+      # -----------------------------
+      # PRE-FLIGHT: fail-closed tag context + strict SemVer
+      # -----------------------------
+      - name: Preflight (require strict tag vX.Y.Z)
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -z "${GITHUB_REF_NAME:-}" ]]; then
+            echo "ERROR: GITHUB_REF_NAME is empty; expected a tag ref." >&2
+            exit 1
+          fi
+          TAG_NAME="${GITHUB_REF_NAME}"
+          if [[ ! "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Tag '${TAG_NAME}' does not match required format 'vX.Y.Z'." >&2
+            exit 1
+          fi
+          echo "OK: strict tag format validated: ${TAG_NAME}"
 
-    KIT_VERSION_FILE="rexce/xcectua-interface/VERSION"
-    if [[ ! -f "${KIT_VERSION_FILE}" ]]; then
-      echo "ERROR: Missing kit version file: ${KIT_VERSION_FILE}" >&2
-      exit 1
-    fi
+      # -----------------------------
+      # INVARIANT: kit VERSION must equal tag version (canonical path in rexec)
+      # -----------------------------
+      - name: Verify Consumer Kit version (tag == VERSION; fail-closed)
+        shell: bash
+        run: |
+          set -euo pipefail
 
-    # Read first line only; strip CR (Windows), trim whitespace.
-    # Fail if blank.
-    KIT_VERSION="$(head -n 1 "${KIT_VERSION_FILE}" | tr -d '\r' | xargs)"
-    if [[ -z "${KIT_VERSION}" ]]; then
-      echo "ERROR: Kit VERSION is empty in ${KIT_VERSION_FILE}" >&2
-      exit 1
-    fi
+          # This workflow is expected to run on tag refs
+          if [[ -z "${GITHUB_REF_NAME:-}" ]]; then
+            echo "ERROR: GITHUB_REF_NAME is empty; expected a tag ref." >&2
+            exit 1
+          fi
 
-    # Optional: enforce kit version is X.Y.Z too (keeps strict determinism)
-    if [[ ! "${KIT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-      echo "ERROR: Kit VERSION '${KIT_VERSION}' does not match required format 'X.Y.Z'." >&2
-      exit 1
-    fi
+          TAG_NAME="${GITHUB_REF_NAME}"
 
-    echo "Tag version : ${TAG_VERSION}"
-    echo "Kit version : ${KIT_VERSION}"
+          # Enforce strict tag format vX.Y.Z
+          if [[ ! "${TAG_NAME}" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Tag '${TAG_NAME}' does not match required format 'vX.Y.Z'." >&2
+            exit 1
+          fi
 
-    if [[ "${TAG_VERSION}" != "${KIT_VERSION}" ]]; then
-      echo "ERROR: VERSION mismatch. Tag '${TAG_NAME}' -> '${TAG_VERSION}' must equal kit VERSION '${KIT_VERSION}'." >&2
-      exit 1
-    fi
+          TAG_VERSION="${TAG_NAME#v}"
 
-    echo "OK: Tag '${TAG_NAME}' matches kit VERSION '${KIT_VERSION}'."
+          KIT_VERSION_FILE="rexce/consumer-kit/VERSION"
+          if [[ ! -f "${KIT_VERSION_FILE}" ]]; then
+            echo "ERROR: Missing consumer kit VERSION file at ${KIT_VERSION_FILE}." >&2
+            exit 1
+          fi
+
+          # Read and normalize VERSION
+          KIT_VERSION="$(head -n 1 "${KIT_VERSION_FILE}" | tr -d '\r' | xargs)"
+          if [[ -z "${KIT_VERSION}" ]]; then
+            echo "ERROR: Consumer kit VERSION is empty." >&2
+            exit 1
+          fi
+
+          # Enforce strict X.Y.Z in VERSION
+          if [[ ! "${KIT_VERSION}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "ERROR: Consumer kit VERSION '${KIT_VERSION}' must be in format X.Y.Z." >&2
+            exit 1
+          fi
+
+          echo "Tag version       : ${TAG_VERSION}"
+          echo "Consumer kit ver. : ${KIT_VERSION}"
+
+          if [[ "${TAG_VERSION}" != "${KIT_VERSION}" ]]; then
+            echo "ERROR: VERSION mismatch. Tag '${TAG_NAME}' must equal consumer kit VERSION '${KIT_VERSION}'." >&2
+            exit 1
+          fi
+
+          echo "OK: Tag '${TAG_NAME}' matches consumer kit VERSION '${KIT_VERSION}'."
+
+      # -----------------------------
+      # POLICY TESTS: rexec remains policy-only; we only test rexec policies/fixtures
+      # -----------------------------
+      - name: Install conftest (pinned)
+        shell: bash
+        run: |
+          set -euo pipefail
+          CONTF_VER="0.53.0"
+          curl -sSL -o /tmp/conftest.tar.gz "https://github.com/open-policy-agent/conftest/releases/download/v${CONTF_VER}/conftest_${CONTF_VER}_Linux_x86_64.tar.gz"
+          sudo tar -C /usr/local/bin -xzf /tmp/conftest.tar.gz conftest
+          conftest --version
+
+      - name: Run rexec policy tests (fixtures)
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -d "policies" || { echo "ERROR: missing policies/"; exit 1; }
+          test -d "policies/tests" || { echo "ERROR: missing policies/tests/"; exit 1; }
+          test -f "policies/policy-settings.yml" || { echo "ERROR: missing policies/policy-settings.yml"; exit 1; }
+
+          # Conftest runs against test fixtures only (rexec stays policy-only)
+          conftest test --no-color --all-namespaces \
+            -p "policies" \
+            -d "policies/policy-settings.yml" \
+            "policies/tests"
+
+      # -----------------------------
+      # CONSUMER KIT INVARIANTS: ensure required kit files exist at release time
+      # -----------------------------
+      - name: Verify Consumer Kit template invariants (fail-closed)
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          # Required kit files
+          test -f "rexce/consumer-kit/VERSION" || { echo "ERROR: missing rexce/consumer-kit/VERSION"; exit 1; }
+          test -f "rexce/consumer-kit/README.md" || { echo "ERROR: missing rexce/consumer-kit/README.md"; exit 1; }
+          test -f "rexce/consumer-kit/PDR-SPEC.md" || { echo "ERROR: missing rexce/consumer-kit/PDR-SPEC.md"; exit 1; }
+
+          # Required template subtree
+          test -f "rexce/consumer-kit/templates/xcectua-circuit/rer/rer.lock.yml" || { echo "ERROR: missing template rer.lock.yml"; exit 1; }
+          test -f "rexce/consumer-kit/templates/xcectua-circuit/.github/CODEOWNERS" || { echo "ERROR: missing template CODEOWNERS"; exit 1; }
+          test -f "rexce/consumer-kit/templates/xcectua-circuit/.github/workflows/rer-governance-gate.yml" || { echo "ERROR: missing template rer-governance-gate.yml"; exit 1; }
+
+          echo "OK: consumer kit invariants present."
+
+      # -----------------------------
+      # RELEASE: create GitHub Release with adoption notes (deterministic body)
+      # -----------------------------
+      - name: Create GitHub Release (adoption notes)
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: false
+          tag_name: ${{ github.ref_name }}
+          name: ${{ github.ref_name }}
+          body: |
+            ## rexec Release (RER) + Consumer Kit
+
+            This release provides:
+            - Authoritative OPA/Conftest policies and settings (policy-only repo)
+            - Consumer Kit templates to enforce RER in CI/CD
+
+            ### Consumer Kit
+            - Location: `rexce/consumer-kit/templates/xcectua-circuit/`
+            - Version: `rexce/consumer-kit/VERSION` (must equal this tag without leading `v`)
+
+            ### Required consumer pinning
+            Consumers MUST pin rexec using a lockfile:
+            - `rer/rer.lock.yml` → `rer.ref: ${{ github.ref_name }}`
+
+            ### Required enforcement
+            Consumers MUST require the status check:
+            - `Validate Release Evidence (RER)`
+
+            ### Notes
+            - `rexec` remains policy-only. Evidence storage and validation execution occur in consumer repositories.

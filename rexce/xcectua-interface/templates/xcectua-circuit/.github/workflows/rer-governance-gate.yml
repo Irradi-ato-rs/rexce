@@ -23,6 +23,15 @@ jobs:
         with:
           fetch-depth: 0  # required for base/head comparisons via git show (promotion append-only)
 
+      - name: Prepare PDR directory
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          rm -rf "${PDR_DIR}"
+          mkdir -p "${PDR_DIR}/logs" "${PDR_DIR}/inputs"
+          echo "PDR workspace initialized at ${PDR_DIR}"
+
       - name: Require COSIGN_PUBLIC_KEY
         shell: bash
         run: |
@@ -70,15 +79,6 @@ jobs:
 
       - name: Install cosign
         uses: sigstore/cosign-installer@v3.6.0
-
-      - name: Prepare PDR directory
-        if: always()
-        shell: bash
-        run: |
-          set -euo pipefail
-          rm -rf "${PDR_DIR}"
-          mkdir -p "${PDR_DIR}/logs" "${PDR_DIR}/inputs"
-          echo "PDR workspace initialized at ${PDR_DIR}"
 
       - name: Compute policy/settings hashes
         shell: bash

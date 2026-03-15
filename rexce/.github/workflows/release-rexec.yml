@@ -1,0 +1,6 @@
+# excerpt — invariant enforcement
+- name: Verify Xcectua Interface version
+  run: |
+    TAG_VERSION="${GITHUB_REF_NAME#v}"
+    KIT_VERSION="$(cat rexce/xcectua-interface/VERSION)"
+    test "${TAG_VERSION}" = "${KIT_VERSION}"

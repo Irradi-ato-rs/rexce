@@ -20,6 +20,8 @@ jobs:
     steps:
       - name: Checkout consumer repository
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0  # required for base/head comparisons via git show (promotion append-only)
 
       - name: Require COSIGN_PUBLIC_KEY
         shell: bash
@@ -44,11 +46,11 @@ jobs:
           POLICIES_PATH="$(yq '.policy_contract.policies_path' "${RER_LOCKFILE}")"
           SETTINGS_PATH="$(yq '.policy_contract.settings_path' "${RER_LOCKFILE}")"
 
-          echo "RER_REPO=${RER_REPO}"           | tee -a $GITHUB_OUTPUT
-          echo "RER_REF=${RER_REF}"             | tee -a $GITHUB_OUTPUT
-          echo "RER_FETCHED_PATH=${RER_FETCHED_PATH}" | tee -a $GITHUB_OUTPUT
-          echo "POLICIES_PATH=${POLICIES_PATH}" | tee -a $GITHUB_OUTPUT
-          echo "SETTINGS_PATH=${SETTINGS_PATH}" | tee -a $GITHUB_OUTPUT
+          echo "RER_REPO=${RER_REPO}"                | tee -a $GITHUB_OUTPUT
+          echo "RER_REF=${RER_REF}"                  | tee -a $GITHUB_OUTPUT
+          echo "RER_FETCHED_PATH=${RER_FETCHED_PATH}"| tee -a $GITHUB_OUTPUT
+          echo "POLICIES_PATH=${POLICIES_PATH}"      | tee -a $GITHUB_OUTPUT
+          echo "SETTINGS_PATH=${SETTINGS_PATH}"      | tee -a $GITHUB_OUTPUT
 
       - name: Fetch rexec at pinned ref
         uses: actions/checkout@v4
@@ -82,9 +84,9 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          set -x
           POL="${{ steps.lock.outputs.POLICIES_PATH }}"
           SET="${{ steps.lock.outputs.SETTINGS_PATH }}"
+          shopt -s globstar nullglob
           sha256sum "${POL}"/**/*.rego "${SET}" | tee "${PDR_DIR}/rer-policy-sha256.txt"
 
       - name: Collect evidence directories (must exist)
@@ -92,11 +94,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          mapfile -t RECORDS < <(find releases -type f -name "release-record.json" 2>/dev/null || true)
+          # POLICY-CONFORMANT: release record is YAML
+          mapfile -t RECORDS < <(find releases -type f -name "release-record.yml" 2>/dev/null || true)
           if [[ ${#RECORDS[@]} -eq 0 ]]; then
-            echo "ERROR: No evidence found (no releases/**/release-record.json)"; exit 1
+            echo "ERROR: No evidence found (no releases/**/release-record.yml)"; exit 1
           fi
-          # Derive unique directories
+
           declare -A SEEN=()
           > "${PDR_DIR}/evidence-dirs.txt"
           for f in "${RECORDS[@]}"; do
@@ -114,7 +117,6 @@ jobs:
         run: |
           set -euo pipefail
           SETTINGS="${{ steps.lock.outputs.SETTINGS_PATH }}"
-          # Convert YAML to JSON then grab required refs array
           yq -o=json '.' "${SETTINGS}" | jq -r '.policy.signature.verify_refs.required[]' | tee "${PDR_DIR}/required-refs.txt"
           if [[ ! -s "${PDR_DIR}/required-refs.txt" ]]; then
             echo "ERROR: No required refs defined at .policy.signature.verify_refs.required[]"; exit 1
@@ -154,30 +156,108 @@ jobs:
             echo "Signature verification failures detected"; exit 1
           fi
 
-      - name: Run conftest (release/promotion/consistency)
+      - name: Compute PR labels (meta.pr_labels)
+        id: prlabels
+        shell: bash
+        run: |
+          set -euo pipefail
+          # Default empty array for push and workflow_dispatch
+          echo '[]' > "${PDR_DIR}/pr-labels.json"
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            jq -c '[.pull_request.labels[].name]' "$GITHUB_EVENT_PATH" > "${PDR_DIR}/pr-labels.json"
+          fi
+          cat "${PDR_DIR}/pr-labels.json" | tee -a "${PDR_DIR}/logs/meta.log"
+
+      - name: Run conftest (release/promotion/consistency) with policy-shaped inputs
         shell: bash
         run: |
           set -euo pipefail
           POL="${{ steps.lock.outputs.POLICIES_PATH }}"
           SET="${{ steps.lock.outputs.SETTINGS_PATH }}"
-          # Write wrapper input per evidence dir and run conftest against it
-          while IFS= read -r evdir; do
-            base="$(echo "$evdir" | tr '/ ' '__')"
-            input_json="${PDR_DIR}/inputs/${base}.json"
-            jq -n --arg evdir "$evdir" --arg set "$SET" '{evidence_dir:$evdir, settings:$set}' > "$input_json"
+          PR_LABELS_JSON="$(cat "${PDR_DIR}/pr-labels.json")"
 
-            echo "Conftest: release ($evdir)" | tee -a "${PDR_DIR}/logs/release.log"
-            if ! conftest test --no-color --all-namespaces -p "${POL}" -d "${SET}" -n release "$input_json" 2>&1 | tee -a "${PDR_DIR}/logs/release.log"; then
+          # Ensure base branch ref is available for PR comparisons (promotion append-only)
+          if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+            git fetch --no-tags --prune --depth=1 origin "${{ github.base_ref }}:refs/remotes/origin/${{ github.base_ref }}" || true
+          fi
+
+          while IFS= read -r evdir; do
+            # Paths
+            RR_YML="${evdir}/release-record.yml"
+            PROMO_JSON="${evdir}/promotion-log.json"
+
+            # Fail-closed for required policy inputs
+            test -f "${RR_YML}" || { echo "ERROR: Missing ${RR_YML}"; exit 1; }
+            test -f "${PROMO_JSON}" || { echo "ERROR: Missing ${PROMO_JSON} (required for promotion/consistency)"; exit 1; }
+
+            # Derive deterministic names/paths for meta
+            RELEASE_DIR_NAME="$(basename "${evdir}")"
+            RELEASE_DIR_PATH="${evdir}"
+
+            # -------------------------
+            # RELEASE namespace input
+            # input == release record object; includes meta.pr_labels
+            # -------------------------
+            release_in="${PDR_DIR}/inputs/$(echo "${evdir}" | tr '/ ' '__')__release.json"
+            yq -o=json '.' "${RR_YML}" \
+              | jq --argjson labels "${PR_LABELS_JSON}" '. + {meta:{pr_labels:$labels}}' \
+              > "${release_in}"
+
+            echo "Conftest: release (${evdir})" | tee -a "${PDR_DIR}/logs/release.log"
+            if ! conftest test --no-color --all-namespaces -p "${POL}" -d "${SET}" -n release "${release_in}" 2>&1 | tee -a "${PDR_DIR}/logs/release.log"; then
               echo "Release policy failures for ${evdir}"; exit 1
             fi
 
-            echo "Conftest: promotion ($evdir)" | tee -a "${PDR_DIR}/logs/promotion.log"
-            if ! conftest test --no-color --all-namespaces -p "${POL}" -d "${SET}" -n promotion "$input_json" 2>&1 | tee -a "${PDR_DIR}/logs/promotion.log"; then
+            # -------------------------
+            # PROMOTION namespace input
+            # input == { base: <obj>|null, head: <obj> }
+            # base is loaded from base branch (PR only) at same path; otherwise null.
+            # -------------------------
+            promotion_in="${PDR_DIR}/inputs/$(echo "${evdir}" | tr '/ ' '__')__promotion.json"
+            head_obj="$(cat "${PROMO_JSON}")"
+
+            base_obj="null"
+            if [[ "${{ github.event_name }}" == "pull_request" ]]; then
+              if git show "origin/${{ github.base_ref }}:${PROMO_JSON}" >/dev/null 2>&1; then
+                base_obj="$(git show "origin/${{ github.base_ref }}:${PROMO_JSON}")"
+              fi
+            fi
+
+            jq -n --argjson base "${base_obj}" --argjson head "${head_obj}" '{base:$base, head:$head}' > "${promotion_in}"
+
+            echo "Conftest: promotion (${evdir})" | tee -a "${PDR_DIR}/logs/promotion.log"
+            if ! conftest test --no-color --all-namespaces -p "${POL}" -d "${SET}" -n promotion "${promotion_in}" 2>&1 | tee -a "${PDR_DIR}/logs/promotion.log"; then
               echo "Promotion policy failures for ${evdir}"; exit 1
             fi
 
-            echo "Conftest: consistency ($evdir)" | tee -a "${PDR_DIR}/logs/consistency.log"
-            if ! conftest test --no-color --all-namespaces -p "${POL}" -d "${SET}" -n consistency "$input_json" 2>&1 | tee -a "${PDR_DIR}/logs/consistency.log"; then
+            # -------------------------
+            # CONSISTENCY namespace input
+            # input == { release_record, promotion_log, postdeploy, meta }
+            # postdeploy is null for golden baseline unless you add postdeploy evidence.
+            # -------------------------
+            consistency_in="${PDR_DIR}/inputs/$(echo "${evdir}" | tr '/ ' '__')__consistency.json"
+            rr_obj="$(yq -o=json '.' "${RR_YML}")"
+            promo_obj="$(cat "${PROMO_JSON}")"
+
+            jq -n \
+              --argjson rr "${rr_obj}" \
+              --argjson promo "${promo_obj}" \
+              --argjson labels "${PR_LABELS_JSON}" \
+              --arg dir_name "${RELEASE_DIR_NAME}" \
+              --arg dir_path "${RELEASE_DIR_PATH}" \
+              '{
+                release_record: $rr,
+                promotion_log: $promo,
+                postdeploy: null,
+                meta: {
+                  release_dir_name: $dir_name,
+                  release_dir_path: $dir_path,
+                  pr_labels: $labels
+                }
+              }' > "${consistency_in}"
+
+            echo "Conftest: consistency (${evdir})" | tee -a "${PDR_DIR}/logs/consistency.log"
+            if ! conftest test --no-color --all-namespaces -p "${POL}" -d "${SET}" -n consistency "${consistency_in}" 2>&1 | tee -a "${PDR_DIR}/logs/consistency.log"; then
               echo "Consistency policy failures for ${evdir}"; exit 1
             fi
           done < "${PDR_DIR}/evidence-dirs.txt"

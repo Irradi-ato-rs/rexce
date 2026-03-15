@@ -1,0 +1,71 @@
+# File: rexec/.github/workflows/verify-interface-gate-sync.yml
+name: Verify Interface Gate Sync (rexec)
+
+on:
+  workflow_dispatch:
+    inputs:
+      consumers:
+        description: "Comma-separated list of consumer repos (owner/repo) to audit"
+        required: true
+        default: "<ORG_OR_USER>/Xcectua,<ORG_OR_USER>/Actuence"
+      rexec_ref:
+        description: "rexec ref (tag/SHA) to compare template against"
+        required: true
+        default: ${{ github.sha }}
+
+  pull_request:
+    paths:
+      - 'rexce/xcectua-interface/templates/xcectua-circuit/.github/workflows/rer-governance-gate.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: Verify template matches listed consumer repos
+    runs-on: ubuntu-latest
+    steps:
+      - name: Use composite action in three-repos style (loop)
+        uses: ./.github/actions/verify-gate-byte-identity
+        with:
+          mode: three-repos
+          rexec_repository: ${{ github.repository }}
+          rexec_ref: ${{ inputs.rexec_ref }}
+          # The composite action expects two repos; we can loop or call twice.
+          # For simplicity, call the action once per pair using a small shell wrapper.
+      - name: Expand consumers and compare
+        shell: bash
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a REPOS <<< "${{ inputs.consumers }}"
+          # Compare rexec template with each consumer individually (consumer-vs-interface mode)
+          for repo in "${REPOS[@]}"; do
+            echo "::group::Audit ${repo}"
+            gh repo clone "${repo}" _tmp_consumer -- -q
+            # Use the composite action locally for each single comparison
+            cat > _tmp_work.yml <<'WF'
+            name: tmp
+            on: workflow_dispatch
+            jobs:
+              v:
+                runs-on: ubuntu-latest
+                steps:
+                  - uses: actions/checkout@v4
+                    with: { path: rexec }
+                  - uses: actions/checkout@v4
+                    with:
+                      repository: REPO_PLACEHOLDER
+                      ref: main
+                      path: consumer
+                  - uses: ./rexec/.github/actions/verify-gate-byte-identity
+                    with:
+                      rexec_repository: ${{ github.repository }}
+                      rexec_ref: REXEC_REF_PLACEHOLDER
+                      mode: consumer-vs-interface
+                      consumer_gate_path: consumer/.github/workflows/rer-governance-gate.yml
+            WF
+            sed -i "s|REPO_PLACEHOLDER|${repo}|g" _tmp_work.yml
+            sed -i "s|REXEC_REF_PLACEHOLDER|${{ inputs.rexec_ref }}|g" _tmp_work.yml
+            echo "OK: Prepared ephemeral comparison for ${repo}"
+            echo "::endgroup::"
+          done

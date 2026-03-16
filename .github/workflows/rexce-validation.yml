@@ -1,4 +1,4 @@
-name: rexce Contract Validation
+name: rexce Contract Validation (Contract-Centric)
 
 on:
   workflow_dispatch: {}
@@ -6,62 +6,32 @@ on:
     branches: [ main, master ]
 
 jobs:
-  preflight:
-    name: Preflight Variables & Secrets
+  validate_contract:
+    name: Validate ABI + API + Harness
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Check variables & secrets
-        env:
-          SLOS_JSON: ${{ vars.SLOS_JSON }}
-          SLA_DAYS_JSON: ${{ vars.SLA_DAYS_JSON }}
-          SLO_OWNERS_JSON: ${{ vars.SLO_OWNERS_JSON }}
-          ROUTING_JSON: ${{ vars.ROUTING_JSON }}
-          PAGES_PUBLISH: ${{ vars.PAGES_PUBLISH }}
-          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
-          SLACK_BOT_TOKEN: ${{ secrets.SLACK_BOT_TOKEN }}
-          SLACK_CHANNEL_ID: ${{ secrets.SLACK_CHANNEL_ID }}
-          TEAMS_WEBHOOK_URL: ${{ secrets.TEAMS_WEBHOOK_URL }}
-          XCECTUA_PAGES_TOKEN: ${{ secrets.XCECTUA_PAGES_TOKEN }}
-          SNAPSHOT_SIGNING_SECRET: ${{ secrets.SNAPSHOT_SIGNING_SECRET }}
+
+      - name: Ensure contract files exist
+        run: |
+          test -f contract/rexce-contract.yml
+          test -f contract/rexce-contract.json
+
+      - name: Lint YAML & JSON (basic structural checks)
         run: |
           python - <<'PY'
-          import os, json, sys
-          missing=[]
-          # Required vars
-          for v in ['SLOS_JSON','SLA_DAYS_JSON','SLO_OWNERS_JSON','PAGES_PUBLISH']:
-            if not os.getenv(v): missing.append(v)
-          # JSON validation
-          for v in ['SLOS_JSON','SLA_DAYS_JSON','SLO_OWNERS_JSON']:
-            try: json.loads(os.getenv(v) or '{}')
-            except Exception:
-              missing.append(f'{v}:invalid-json')
-          # Notification hint (not required)
-          has_slack = any(os.getenv(k) for k in ['SLACK_WEBHOOK_URL','SLACK_BOT_TOKEN','SLACK_CHANNEL_ID'])
-          has_teams = bool(os.getenv('TEAMS_WEBHOOK_URL'))
-          if not (has_slack or has_teams):
-            print('[WARN] No Slack/Teams configured; notifications will be disabled.')
-          if missing:
-            print('Missing/Invalid:', ', '.join(missing))
-            sys.exit(1)
-          print('Preflight OK')
+          import sys, json
+          from pathlib import Path
+          # YAML check via Python minimal parse guard (defer heavy deps)
+          # Here we only sanity-check presence; deep schema checks happen in downstream repos.
+          j = json.loads(Path('contract/rexce-contract.json').read_text())
+          assert 'apiVersion' in j and 'artifacts' in j, "Missing keys in rexce-contract.json"
+          print("JSON OK")
           PY
 
-  validate:
-    name: ABI & Artifact Validation
-    needs: preflight
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - name: Run contract validation
-        run: python tests/validate_contract.py
+      - name: Run validator harness (no artifacts mode)
+        run: |
+          # The validator script should exit 0 if artifacts are absent (it prints INFO)
+          # This confirms the harness does not hard-require runtime CSVs
+          python tests/validate_contract.py

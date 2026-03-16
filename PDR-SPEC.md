@@ -40,4 +40,4 @@ pdr/
 - Run `conftest` namespaces: `release`, `promotion`, `consistency`.
 - **Always upload** PDR, even on failure.
 
-> **Location requirement**: This file must remain at the **rexec repository root** (not under `rexce/`).
+> **Location requirement**: This file must remain at the **rexce repository root** (not under `rexce/`).

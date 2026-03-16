@@ -1,0 +1,72 @@
+{
+  "apiVersion": "1.0.0",
+  "description": "Versioned governance API contract for Xcectua ↔ rexce",
+  "governance": {
+    "reason": {
+      "id": {
+        "type": "string",
+        "pattern": "^[a-z][a-z0-9_]*$"
+      },
+      "semantics": "Immutable identifier of drift reason"
+    },
+    "repo": {
+      "id": {
+        "type": "string",
+        "pattern": "^org\\/repo$"
+      }
+    },
+    "pr": {
+      "url": {
+        "type": "string",
+        "pattern": "^https:\\/\\/github\\.com\\/org\\/repo\\/pull\\/[1-9][0-9]*$"
+      }
+    },
+    "timestamp": {
+      "utc": true,
+      "pattern": "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+    },
+    "ordering": {
+      "reasons": "alphabetical",
+      "repos": "alphabetical",
+      "prs": "repo_then_numeric_pr",
+      "weekly_rollups": "chronological"
+    }
+  },
+  "artifacts": {
+    "remediated.csv": {
+      "required": true,
+      "columns": [
+        "repo",
+        "pr_url",
+        "timestamp",
+        "reasons"
+      ],
+      "notes": "reasons is a comma-separated list of reason codes"
+    },
+    "weekly_reason_rollup.csv": {
+      "required": true,
+      "columns": [
+        "reason",
+        "total_count"
+      ]
+    },
+    "slo_report.md": {
+      "required": false
+    },
+    "sla_status.csv": {
+      "required": false
+    },
+    "site/snapshot.manifest.json": {
+      "required": false
+    },
+    "site/snapshot.signature": {
+      "required": false
+    }
+  },
+  "prohibitions": {
+    "rexce": [
+      "Must not consume observability artifacts as policy input",
+      "Must not change semantics of FAIL without version bump"
+    ]
+  }
+}

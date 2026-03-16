@@ -1,0 +1,88 @@
+# rexce ABI Contract (Stable for all future Xcectua releases)
+# Version: 1.0.0
+# Status: GA
+
+abi:
+  version: 1.0.0
+  description: >-
+    Immutable, version‑agnostic contract between Xcectua (observability + automation)
+    and rexce (policy authority). This schema defines the stable fields and constraints
+    that MUST NOT change across releases.
+
+  invariants:
+    reason_codes:
+      type: string
+      style: snake_case
+      regex: "^[a-z][a-z0-9_]*$"
+      examples: ["permissions_diff", "action_ref_mismatch"]
+      notes: "Adding new reasons allowed; renames/format changes are disallowed."
+    repo_id:
+      pattern: "^org\\/repo$"
+      examples: ["org/repo"]
+      notes: "Canonical repo identifier; URLs/IDs/shorthand are not allowed."
+    pr_url:
+      pattern: "^https:\\/\\/github\\.com\\/org\\/repo\\/pull\\/[1-9][0-9]*$"
+      examples: ["https://github.com/org/repo/pull/1234"]
+    timestamp:
+      rfc3339_utc: true
+      pattern: "^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}Z$"
+      examples: ["2026-03-10T09:12:33Z"]
+    ordering:
+      reasons: alphabetical
+      repos: alphabetical
+      prs: repo_then_numeric_pr
+      weekly_rollups: chronological
+
+  artifacts:
+    remediated_csv:
+      path: "remediated.csv"
+      required_columns: [repo, pr_url, timestamp, reasons]
+      column_constraints:
+        repo: { pattern_ref: repo_id }
+        pr_url: { pattern_ref: pr_url }
+        timestamp: { pattern_ref: timestamp }
+        reasons:
+          type: csv_inline
+          items: { pattern_ref: reason_codes }
+      ordering: prs
+
+    weekly_reason_rollup_csv:
+      path: "weekly_reason_rollup.csv"
+      required_columns: [reason, total_count]
+      column_constraints:
+        reason: { pattern_ref: reason_codes }
+        total_count: { type: integer, minimum: 0 }
+      ordering: reasons
+
+    slo_report_md:
+      path: "slo_report.md"
+      semantics:
+        fail_line_regex: "^-\\s+([^:]+):\\s+\\d+.*\\*\\*FAIL\\*\\*\\s*$"
+
+    sla_status_csv:
+      path: "sla_status.csv"
+      required_columns: [reason, first_fail_date, days_open, sla_days, due_date, status]
+      column_constraints:
+        reason: { pattern_ref: reason_codes }
+        first_fail_date: { pattern: "^\\d{4}-\\d{2}-\\d{2}$" }
+        days_open: { type: integer, minimum: 0 }
+        sla_days: { type: integer, minimum: 1 }
+        due_date: { pattern: "^\\d{4}-\\d{2}-\\d{2}$" }
+        status: { enum: [on_track, at_risk, overdue] }
+
+    snapshot_manifest_json:
+      path: "site/snapshot.manifest.json"
+      fields:
+        generated_at_utc: { pattern_ref: timestamp }
+        files: { type: object, additionalProperties: { pattern: "^[a-f0-9]{64}$" } }
+
+    snapshot_signature:
+      path: "site/snapshot.signature"
+      optional: true
+      semantics: "If SNAPSHOT_SIGNING_SECRET present in CI, signature MUST be valid HMAC‑SHA256 over manifest JSON (minified)."
+
+  prohibitions:
+    rexce_must_not_consume:
+      - "CSVs/MD/heatmaps/trends/leaderboards/SLA/routing as policy inputs"
+    xcectua_must_not_require:
+      - "rexce changes for observability features"

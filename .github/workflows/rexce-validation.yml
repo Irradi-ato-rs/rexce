@@ -1,13 +1,14 @@
+# rexce/.github/workflows/rexce-validate.yml
 name: rexce/validate
 
 on:
+  workflow_call:
   pull_request:
   push:
-    branches:
-      - main
+    branches: [ main ]
 
 jobs:
-  validate_contract:
+  validate:
     name: rexce/validate
     runs-on: ubuntu-latest
     steps:

@@ -1,8 +1,8 @@
 name: rexce/validate
 
 on:
-    pull_request:
-    push:
+  pull_request:
+  push:
     branches:
       - main
 
@@ -13,7 +13,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - run: python tests/validate_contract.py
-
+      
       - name: Ensure contract files exist
         run: |
           test -f contract/rexce-contract.yml

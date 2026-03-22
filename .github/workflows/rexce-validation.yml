@@ -1,17 +1,18 @@
-name: rexce Contract Validation (Contract-Centric)
+name: rexce/validate
 
 on:
-  workflow_dispatch: {}
-  pull_request:
-    branches: [ main, master ]
+    pull_request:
+    push:
+    branches:
+      - main
 
 jobs:
   validate_contract:
-    name: Validate ABI + API + Harness
+    name: rexce/validate
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
+      - run: python tests/validate_contract.py
 
       - name: Ensure contract files exist
         run: |
